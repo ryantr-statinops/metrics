@@ -45,12 +45,15 @@ export class RecentAnalyzer extends Analyzer {
     try {
       for (let page = 1; page <= pages; page++) {
         this.debug(`fetching events page ${page}`)
+        const events = (await (this.context.mode === "repository" ? this.rest.activity.listRepoEvents(this.context) : this.rest.activity.listEventsForAuthenticatedUser({username: this.login, per_page: 100, page}))).data ?? []
         commits.push(
-          ...(await (this.context.mode === "repository" ? this.rest.activity.listRepoEvents(this.context) : this.rest.activity.listEventsForAuthenticatedUser({username: this.login, per_page: 100, page}))).data
-            .filter(({type, payload}) => (type === "PushEvent") && ((this.context.mode !== "repository") || ((this.context.mode === "repository") && (payload?.ref?.includes?.(`refs/heads/${this.context.branch}`)))))
-            .filter(({actor}) => (this.account === "organization") || (this.context.mode === "repository") ? true : !filters.text(actor.login, [this.login], {debug: false}))
-            .filter(({repo: {name: repo}}) => !this.ignore(repo))
-            .filter(({created_at}) => ((!this.days) || (new Date(created_at) > new Date(Date.now() - this.days * 24 * 60 * 60 * 1000)))),
+          ...events
+            .filter(event => event?.type === "PushEvent")
+            .filter(event => (this.context.mode !== "repository") || event.payload?.ref?.includes?.(`refs/heads/${this.context.branch}`))
+            .filter(event => (this.account === "organization") || (this.context.mode === "repository") || !filters.text(event.actor?.login, [this.login], {debug: false}))
+            .filter(event => !this.ignore(event.repo?.name))
+            .filter(event => ((!this.days) || (new Date(event.created_at) > new Date(Date.now() - this.days * 24 * 60 * 60 * 1000))))
+            .filter(event => Array.isArray(event.payload?.commits)),
         )
       }
     }
@@ -66,7 +69,8 @@ export class RecentAnalyzer extends Analyzer {
     const patches = [
       ...await Promise.allSettled(
         commits
-          .flatMap(({payload}) => payload.commits)
+          .flatMap(event => event.payload?.commits ?? [])
+          .filter(commit => commit?.url)
           .filter(({committer}) => filters.text(committer?.email, this.authoring, {debug: false}))
           .map(commit => commit.url)
           .map(async commit => (await this.rest.request(commit)).data),
@@ -74,8 +78,8 @@ export class RecentAnalyzer extends Analyzer {
     ]
       .filter(({status}) => status === "fulfilled")
       .map(({value}) => value)
-      .filter(({parents}) => parents.length <= 1)
-      .map(({sha, commit: {message, committer}, verification, files}) => ({
+      .filter(({value}) => value?.commit && Array.isArray(value.files) && Array.isArray(value.parents) && value.parents.length <= 1)
+      .map(({value: {sha, commit: {message, committer}, verification, files}}) => ({
         sha,
         name: `${message} (authored by ${committer.name} on ${committer.date})`,
         verified: verification?.verified ?? null,
